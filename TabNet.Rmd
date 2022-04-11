@@ -1,0 +1,244 @@
+---
+title: "TabNet Notebook"
+output: html_notebook
+author: "Sean Fitzgerald"
+date: "6 - Apr - 2022"
+---
+
+# TabNet
+
+Implemenation in R based on the Rstudio AI blog write-up and the torch backend:
+https://blogs.rstudio.com/ai/posts/2021-02-11-tabnet/
+
+Load Libraries
+
+```{r}
+
+library(tidytable)
+library(tidymodels)
+library(finetune)
+library(ggplot2)
+
+library(torch)
+library(tabnet)
+library(vip)
+
+set.seed(321)
+torch_manual_seed(321)
+```
+
+# Load Data
+
+```{r}
+
+source("/home/sean/pCloudDrive/R functions/read_all.R")
+
+
+df <- read_all("/home/sean/Work/Seren_OD/rMDD_latest_v2") %>%
+  mutate.(subject = stringr::str_replace(subject, 
+                                         "/home/sean/Work/Seren_OD/rMDD_latest_v2/rMDD",
+                                         " ")) %>% 
+  mutate.(subject = stringr::str_replace(subject, 
+                                         ".csv",
+                                         " ")) %>%
+  mutate.(subject = as.numeric(subject))
+
+class_labels <- fread.("/home/sean/Work/Seren_OD/Participant_classes.csv") %>% 
+  rename(subject = Participant_ID)
+
+df <- left_join.(df, class_labels) %>% 
+  # pivot_wider.(names_from = channel, values_from = bandpower_alpha:auc) %>% 
+  mutate.(Participant_Class = as.factor(ifelse.(subject < 31, "Control", "MDD"))) %>% 
+  select.(-subject) 
+ 
+
+```
+
+
+# Data split
+
+```{r}
+
+test_frac <- 0.2
+
+split <- initial_split(df, prop = (1 - test_frac), strata = Participant_Class)
+train_data <- training(split)
+test_data  <- testing(split)
+```
+
+# Data preprocessing
+
+One benefit of this model is that it does not need extensive preprocessing of the data features (similar to Decision Trees, Random Forests, XGBoost).
+
+The recipe is fairly simple, the class variable will be predicted by all other variables in the data. 
+
+```{r}
+
+rec <- recipe(Participant_Class ~ ., train_data)
+
+```
+
+
+# Specify the model and pipeline
+```{r}
+
+# hyperparameter settings for tuning
+
+
+# mod <- tabnet(epochs = 5,
+#               batch_size = 5,
+#               decision_width = tune(),
+#               attention_width = 3,
+#               num_steps = tune(),
+#               # penalty = 0.000001,
+#               # virtual_batch_size = 512,
+#               momentum = 0.02,
+#               feature_reusage = 1.5,
+#               learn_rate = tune()) %>%
+  
+mod <- tabnet(epochs = 10) %>% 
+  set_engine("torch", verbose = TRUE) %>%
+  set_mode("classification")
+
+wf <- workflow() %>%
+  add_model(mod) %>%
+  add_recipe(rec)
+
+```
+
+# fit
+```{r}
+fitted_model <- wf %>% fit(train_data)
+```
+
+# Evaluate
+
+```{r}
+
+
+preds <- test_data %>% 
+  bind_cols(., predict(fitted_model, test_data))
+
+yardstick::mcc(preds, Participant_Class, .pred_class)
+
+
+```
+
+# Hyperparameter Tuning
+
+## Specify the search space for possible hyperparameters
+
+```{r}
+
+# Set up a model with tun() for the parameters that you want to estimate through cross validation
+
+mod <- tabnet(epochs = 5,
+              decision_width = tune(),
+              attention_width = tune(),
+              num_steps = tune(),
+              # penalty = 0.000001,
+              # virtual_batch_size = 512,
+              momentum = 0.02,
+              feature_reusage = 1.5,
+              learn_rate = tune()) %>%
+  set_engine("torch", verbose = TRUE) %>%
+  set_mode("classification")
+
+wf <- workflow() %>%
+  add_model(mod) %>%
+  add_recipe(rec)
+
+
+grid <-
+  wf %>%
+  parameters() %>%
+  update(
+    decision_width = decision_width(range = c(8, 15)),
+    attention_width = attention_width(range = c(2, 10)),
+    num_steps = num_steps(range = c(3, 10)),
+    learn_rate = learn_rate(range = c(-2.5, -1))
+  ) %>%
+  grid_latin_hypercube(size = 10)
+
+grid
+
+
+```
+
+## v-Cross-fold validation for hyperparameter search
+Warning, long runtime here.
+```{r}
+
+
+ctrl <- control_race(verbose_elim = TRUE)
+folds <- vfold_cv(train_data, v = 3)
+set.seed(321)
+
+res <- wf %>% 
+    tune_race_anova(
+    resamples = folds, 
+    grid = grid,
+    control = ctrl
+  )
+
+```
+
+
+```{r}
+
+res %>% show_best("mcc") %>% select(- c(.estimator, .config))
+
+```
+
+
+# Test set predictions
+Using the best performing hyperparameters, show the performance of the test set data
+
+```{r}
+
+preds <- test_data %>% 
+  bind_cols(predict(fitted_model, test_data)) %>% 
+  select.(Participant_Class, .pred_class, everything())
+
+
+yardstick::mcc(preds, Participant_Class, .pred_class)
+```
+
+
+# Show feature importance scores
+
+```{r}
+fit <- extract_fit_parsnip(fitted_model)
+vip(fit) + theme_classic()
+
+```
+
+
+# Show observation-level feature importance
+The model uses different features on different observations and doesn't rely on a few dominant features
+
+```{r}
+
+# create teh observation set you want to use. i.e. the first 100 observations of the test set or all of the test set
+
+# explainer_data <- test_data[1:100, ]
+explainer_data <- test_data
+
+ex_fit <- tabnet_explain(fit$fit, explainer_data)
+
+ex_fit$M_explain %>%
+  mutate(observation = row_number()) %>%
+  pivot_longer(-observation, names_to = "variable", values_to = "m_agg") %>%
+  ggplot(aes(x = observation, y = variable, fill = m_agg)) +
+  geom_tile() +
+  theme_minimal() + 
+  scale_fill_viridis_c()
+
+
+```
+
+
+
+
+
+
